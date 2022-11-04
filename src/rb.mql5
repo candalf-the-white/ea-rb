@@ -1,0 +1,371 @@
+#include <Trade/Trade.mqh>
+// range based  bot
+#property copyright "Copyright 2022, adelphos.org"
+#property link      "https://github.com/candalf-the-white/ea-rb"
+#property version   "1.00"
+
+// inputz
+input string            RNG_OPEN      = "16:30";      // RANGE Calc Start  Time  (16:30)
+input string            RNG_CLOSE     = "17:30";      // RANGE Calc End    Time  (17:30)
+input ENUM_TIMEFRAMES   RNG_PERIOD    = PERIOD_M1;    // RANGE Period for Calculations
+// 16:30 is open; 23:00 is close
+input string       ORD_CLOSE     = "22:15";      // Close Open ORDERS Time  (22:15)
+input bool         CLOSE_POS     = true;         // Close Open Positions    (true)
+input string       POS_CLOSE     = "22:45";      // Close Positions   Time  (22:45)
+input bool         MARKET        = false;        // Buy/Sell Market orders
+// lots
+input int      SPEND_PCT         = 35;           // Spend Percent
+input int      SLIPPAGE          = 30;           // Slippage Points Allowed
+input double   STOP_SZ           = 2;            // Stop Factor
+input double   TGT_SZ            = 3;            // Target Factor        
+
+// globalz
+const    ulong    MAGIC_NUMBER  = 20221104;
+const    int      POS_BUY_MAX   = 1;                  // these may get moved to input
+const    int      POS_SELL_MAX  = 1;
+const    double   RNG_TOL       = .025;               // pct tolerance between range and order pricing
+//
+CTrade   Trade;
+datetime RangeOpen, RangeClose, OrdClose, PosClose;   // times
+double   RangeHi, RangeLo;
+string   stocklist          = _Symbol;                // comma-sep
+     
+
+// struct to keep track of anything related to a particular security
+struct Security {
+   string      symbol;
+   datetime    ts_range;
+   datetime    ts_chart;
+   
+      void        init (string s, datetime tsp, datetime tsc) {
+         symbol    = s;
+         ts_range  = tsp;     // range timeframe
+         ts_chart  = tsc;     // chart timefram
+      }
+};
+Security Securities[];
+
+int OnInit()
+{
+   Print("Arby welcomes RLT traders");
+   // this is done for the convenience of the user being able to enter a list of symbols
+   // we could track these separately, but this could become unwieldy
+   string buf[];
+   int bufsz = StringSplit(stocklist, StringGetCharacter(",", 0), buf);
+   if (ArrayResize(Securities, bufsz) < 0 ) { return (INIT_FAILED); }
+   for (int i = 0; i < bufsz; i++) {
+      Securities[i].init(buf[i], NULL, NULL);
+   }
+   
+   // initialize a few globals
+   RangeOpen = 0; RangeClose = 0; OrdClose = 0; PosClose = 0;
+   RangeHi = 0; RangeLo = 0;
+   
+   Trade.SetExpertMagicNumber(MAGIC_NUMBER); // keep track of our orders/positions
+   
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason) { EventKillTimer(); }
+   
+void OnTick() { int retval = fmain(); }
+
+int fmain(void) 
+{
+   if (!buildRangeTimes()) return 1;
+   
+   uint numsecu = ArraySize(Securities);      // TODO framework to handle multiple securities; not implemented
+   for (uint i = 0; i < numsecu; i++) {
+      // check for new bar
+      datetime rangetime = iTime(Securities[i].symbol, RNG_PERIOD, 0);
+      datetime charttime = iTime(Securities[i].symbol, PERIOD_CURRENT, 0);
+
+      if (rangetime >= RangeOpen && rangetime < RangeClose) {
+         // this needs to be done at tick frequency 
+         if (Securities[i].ts_range != rangetime){
+            rangeFind(Securities[i].symbol, RNG_PERIOD);
+            //Securities[i].ts_range = rangetime;
+         }
+      } else if (rangetime >= RangeClose) {           // don't go here until we are past range-time
+      
+         if (Securities[i].ts_range == 0) {           // we need to place our daily orders
+            Print("Ranging complete at: ", rangetime);
+            if (! (createOrders(Securities[i].symbol) > 0))
+               return 0;
+            Securities[i].ts_range = -1;               // orders placed, daily timer set
+         }
+         
+         else {                                       // we have our ranges and daily orders placed
+            if (Securities[i].ts_chart != charttime) {
+               if (Securities[i].ts_chart > OrdClose && OrdersTotal() > 0) {  // close open orders
+                  Print("Orders closed time reached: ", charttime);
+                  closeAllOrders(Securities[i].symbol);
+               }
+            
+               // time to close ALL for the day
+               if (Securities[i].ts_chart >= PosClose && PositionsTotal() > 0 && CLOSE_POS) {
+                  Print("All closed time reached: ", charttime);
+                  closeAll(Securities[i].symbol);
+               }
+            }
+         }
+      }
+      // track current bar
+      Securities[i].ts_chart = charttime;
+
+   }
+   return 0;
+}
+
+// quick method to deal with user inputs and build applicable ranges for times, etc..
+// returns false if we detect an error
+bool buildRangeTimes()
+{
+   MqlDateTime mdtnow;
+   datetime now = TimeCurrent(mdtnow);
+   static int dow = -1;
+   
+   // user inputs datetime which we calculate everyday based on data
+   // a simpler way would be to ask for hour and minute integers, but this
+   // is annoying, so we just ask for time: 21:45 
+   if (mdtnow.day_of_week != dow) { // new day
+      dow = mdtnow.day_of_week;
+      Print("Initializing configuration for: ", now);
+      
+      RangeOpen = StringToTime(RNG_OPEN);
+      RangeClose = StringToTime(RNG_CLOSE);
+      OrdClose = StringToTime(ORD_CLOSE);
+      PosClose = CLOSE_POS == true ? StringToTime(POS_CLOSE) : 0;
+      
+      // reset our ranges for the new day
+      RangeHi = 0; RangeLo = 0;
+      
+      uint numsecu = ArraySize(Securities);      // reset counters for each security we track
+      for (uint i = 0; i < numsecu; i++) { 
+         Securities[i].ts_chart = 0;
+         Securities[i].ts_range = 0;
+      }
+   }
+   
+   return !validInputs() ? false : true;
+}
+
+enum ENUM_ROUND_DIR {
+   UP = 0,
+   DOWN = 1
+};
+
+double roundUpDn(double value, int digits = 2, ENUM_ROUND_DIR dir = UP)
+{
+   double mult = MathPow(10.0, digits);
+   return dir == DOWN ? MathFloor(value * mult)/mult : NormalizeDouble(value, digits);
+}
+
+
+// enter an order
+ulong orderEntry(string symbol, const ENUM_ORDER_TYPE type)
+{
+   ulong resultTicket = 0;
+   //double tol = 1 + RNG_TOL/100;          // percent tolerance between range and entry pricing
+   
+   int    digit = (int)SymbolInfoInteger(symbol,SYMBOL_DIGITS);
+   double ask=roundUpDn(SymbolInfoDouble(symbol,SYMBOL_ASK),digit);
+   double bid=roundUpDn(SymbolInfoDouble(symbol,SYMBOL_BID),digit);
+   
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   double spend = roundUpDn(bal * SPEND_PCT / 100);      // 35000
+   double contSz = roundUpDn(SymbolInfoDouble(symbol,SYMBOL_TRADE_CONTRACT_SIZE),digit);
+   double lots = 0, stop = 0, target = 0;
+   
+   if (type==ORDER_TYPE_BUY) {
+      // TODO total lots across all symbols - just assumes symbol traded for now
+      lots = roundUpDn(spend/RangeHi/contSz, digit, DOWN);
+      // if we don't specify a stop; set stop to the opposite range
+      stop = STOP_SZ == 0 ? RangeLo : RangeHi / (1 + (STOP_SZ / 100));
+      // if we don't specify a target, we will let our daily close take affect
+      target = TGT_SZ == 0 ? TGT_SZ : RangeHi * (1 + (TGT_SZ / 100)); 
+      
+      if (MARKET) 
+         resultTicket = Trade.Buy(lots, symbol, RangeHi, stop, target, "arby1: buy market");
+      else {
+         Print(__FUNCTION__, "(): opening buy stop");
+         resultTicket = Trade.BuyStop(lots, RangeHi, symbol, stop, target, ORDER_TIME_SPECIFIED_DAY, OrdClose, "arby1: buy stop");
+      }
+   } else if (type==ORDER_TYPE_SELL) {
+      // TODO total lots across all symbols - just assumes symbol traded for now
+      lots = roundUpDn(spend/RangeLo/contSz, digit, DOWN);
+      stop = STOP_SZ == 0 ? RangeHi : RangeLo * (1 + (STOP_SZ / 100));
+      target = TGT_SZ == 0 ? TGT_SZ : RangeLo / (1 + (TGT_SZ / 100)); 
+      
+      Print(stop," ", target);
+      if (MARKET)
+         resultTicket = Trade.Sell(lots, symbol, RangeLo, stop, target, "arby1: sell market");
+      else {
+         Print(__FUNCTION__, "(): opening buy stop");
+         resultTicket = Trade.SellStop(lots, RangeLo, symbol, stop, target, ORDER_TIME_SPECIFIED_DAY, OrdClose, "arby1: sell stop");
+      }
+   }
+   return resultTicket;
+}
+
+int closeAll(string symbol) 
+{
+   int orders = 0, positions = 0;
+   if ((orders = closeAllOrders(symbol)) > 0)
+      Print(__FUNCTION__, " closed ", orders, " open orders");
+   if ((positions = closeAllPositions(symbol)) > 0)
+      Print(__FUNCTION__, " closed ", positions, " open positions");
+    return orders + positions;
+}
+
+int closeAllPositions(string symbol)
+{
+   int closed = 0;
+   for(int i = 0; i < PositionsTotal(); i++) {
+      ulong ticket = PositionGetTicket(i);
+      if (PositionGetString(POSITION_SYMBOL) == symbol &&
+            PositionGetInteger(POSITION_MAGIC) == MAGIC_NUMBER) {
+               if (!Trade.PositionClose(ticket, SLIPPAGE))
+                  Alert(__FUNCTION__, " unable to close position: ", ticket);
+               else 
+                  closed ++;
+      }
+   }
+   return closed;
+}
+
+int closeAllOrders(string symbol)
+{
+   int closed = 0;
+   for(int i = 0; i < OrdersTotal(); i++) {
+      ulong ticket = OrderGetTicket(i);
+      if (OrderGetString(ORDER_SYMBOL) == symbol &&
+            OrderGetInteger(ORDER_MAGIC) == MAGIC_NUMBER) {
+               Trade.OrderDelete(ticket);
+               closed ++;
+      }
+   }
+   return closed;
+}
+
+// check to see if we have our two daily stop orders in place
+int createOrders(string symbol)
+{
+   int orders = OrdersTotal();
+   int positions = PositionsTotal();
+   // the user could flag not to close positions
+   //  but we should not have open orders
+   if (orders > 0) {
+      Alert(__FUNCTION__, "() - unknown orders:", orders, " pos:", positions);
+      return -1;
+   }
+  
+   int bp = 0, sp = 0;    
+   // lets enumerate our open positions
+   //   at this point we should not have any open orders as they are cancelled daily
+   //   and this is a new day
+   for (int i = 0; i < positions; i++) {
+      ulong order = PositionGetTicket(i);
+      if (PositionGetString(POSITION_SYMBOL) == symbol &&
+            PositionGetInteger(POSITION_MAGIC) == MAGIC_NUMBER) {
+         switch ((int) PositionGetInteger(POSITION_TYPE)) {
+            case POSITION_TYPE_SELL:
+               sp++;
+               break;
+            case POSITION_TYPE_BUY:
+               bp++;
+               break;
+            default:
+               Print(__FUNCTION__, " unknown POSITION_TYPE");
+               break;
+         }
+      }
+   }
+   Print("sp open:", sp, " bp open:", bp);
+   ulong retval = 0;
+   while (bp < POS_BUY_MAX) {
+      if (! (retval = orderEntry(symbol, ORDER_TYPE_BUY))) {
+         Print(__FUNCTION__, "(): unable to complete buy orderEntry() on: ", symbol, " [", retval,"]");
+         return -1;
+      }
+      bp++;
+   }
+   
+   while (sp < POS_SELL_MAX) {
+      if (! (retval = orderEntry(symbol, ORDER_TYPE_SELL))) {
+         Print(__FUNCTION__, "(): unable to complete sell orderEntry() on: ", symbol, " [", retval,"]");
+         return -1;
+      }
+      sp++;
+   }
+   
+   return OrdersTotal();
+}
+// finds the range
+void rangeFind(string symbol, ENUM_TIMEFRAMES rt, int shift = 0)
+{
+   double hi = iHigh(symbol, rt, shift);
+   double lo = iLow(symbol, rt, shift);
+   
+   // set our RangeHiLo values to the highest/lowest we've seen
+   RangeHi = hi < RangeHi ? RangeHi : hi; 
+   RangeLo = RangeLo == 0 ? lo : RangeLo < lo ? RangeLo : lo;
+
+   PrintFormat("RangeHi: %f  RangeLo: %f", RangeHi, RangeLo);
+   if (!createTrend("RNGHI", RangeHi, clrAqua, 1, RangeOpen, RangeClose) ||
+               !createTrend("RNGLO", RangeLo, clrAqua, 1, RangeOpen, RangeClose)) {
+            die("exiting - unable to draw trendlines for range hilo");
+   }
+   return;
+}
+
+// function to do some input validation if needed
+bool validInputs()
+{
+   // did the user enter invalid range calc times
+   if (RangeClose < RangeOpen) {
+      die("RangeClose time less than RangeOpen.");
+      return false;
+   }
+   return true;
+}
+
+bool checkTime(datetime t_bar)
+{
+   return true; // nothin yet
+}
+bool createTrend(string objName, double price, color clr, int width, datetime time1, datetime time2)
+{
+   //--- set anchor points' coordinates if they are not set 
+   //ChangeTrendEmptyPoints(time1,price,time2,price);  
+   ResetLastError(); 
+ 
+   if(!ObjectCreate(0,objName,OBJ_TREND,0,time1,price,time2,price)) 
+     { 
+      Print(__FUNCTION__, 
+            ": failed to create a trend line! Error code = ",GetLastError()); 
+      return(false); 
+     } 
+ 
+   ObjectSetInteger(0,objName,OBJPROP_COLOR,clr); 
+   ObjectSetInteger(0,objName,OBJPROP_STYLE,STYLE_SOLID ); 
+   ObjectSetInteger(0,objName,OBJPROP_WIDTH,width);  
+   ObjectSetInteger(0,objName,OBJPROP_BACK,false);  
+   ObjectSetInteger(0,objName,OBJPROP_SELECTABLE,false); 
+   //ObjectSetInteger(0,objName,OBJPROP_SELECTED,selection); 
+   ObjectSetInteger(0,objName,OBJPROP_RAY_LEFT,false); 
+   ObjectSetInteger(0,objName,OBJPROP_RAY_RIGHT,false); 
+   ObjectSetInteger(0,objName,OBJPROP_HIDDEN,false);  
+   //ObjectSetInteger(0,objName,OBJPROP_ZORDER,z_order); 
+ 
+   return(true);
+
+}
+
+void die(string msg)
+{
+   Alert(msg);
+   Print("FATAL: ", msg);
+   ExpertRemove();
+   return;
+}
